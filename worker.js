@@ -27,7 +27,7 @@ export default {
     let response;
     try {
       response = await fetch(full, {
-        headers: { Upgrade: "websocket" },
+        headers: request.headers,
       });
     } catch (e) {
       return new Response("Error: "+e, {
