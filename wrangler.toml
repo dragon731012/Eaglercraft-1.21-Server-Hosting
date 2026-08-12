@@ -1,6 +1,0 @@
-name = "eagler-ws-proxy"
-main = "worker.js"
-compatibility_date = "2026-08-12"
-
-[vars]
-SERVER = "SERVERADDRESS:25565"
