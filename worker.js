@@ -2,7 +2,7 @@ export default {
   async fetch(request, env) {
     const upgrade = request.headers.get("Upgrade");
   
-    if (upgrade != "websocket") {
+    if (upgrade !== "websocket") {
       return new Response(
         "Connect from an eaglercraft client, not the browser.",
         { 
@@ -22,12 +22,12 @@ export default {
       );
     }
   
-    const full = "ws://"+address;
+    const full = "http://"+address;
   
     let response;
     try {
       response = await fetch(full, {
-        headers: request.headers 
+        headers: { Upgrade: "websocket" },
       });
     } catch (e) {
       return new Response("Error: "+e, {
