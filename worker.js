@@ -22,7 +22,7 @@ export default {
       );
     }
   
-    const full = "http://"+address;
+    const full = "https://"+address;
   
     let response;
     try {
