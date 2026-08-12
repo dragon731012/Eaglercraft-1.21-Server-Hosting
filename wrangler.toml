@@ -1,0 +1,4 @@
+main = "worker.js"
+
+[vars]
+SERVER = "SERVERADDRESS:25565"
