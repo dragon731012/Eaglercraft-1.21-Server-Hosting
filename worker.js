@@ -131,7 +131,13 @@ class reader {
 export default {
   async fetch(request, env, ctx) {
     if ((request.headers.get("Upgrade") || "").toLowerCase() !== "websocket") {
-      return new Response("join from an eagler client, not from the browser", { status: 426 });
+      return new Response(
+        `<script>window.location.href=${JSON.stringify(env.CLIENT)};</script>`,
+        {
+          status: 200,
+          headers: { "Content-Type": "text/html;charset=UTF-8" },
+        }
+      );
     }
 
     const split = env.SERVER.lastIndexOf(":");
