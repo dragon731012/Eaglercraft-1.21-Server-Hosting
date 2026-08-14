@@ -3,6 +3,7 @@
   "main": "worker.js",
   "compatibility_date": "2026-08-12",
   "vars": {
-    "SERVER": "SERVERADDRESS:25565"
+    "SERVER": "SERVERADDRESS:25565",
+    "CLIENT": "https://eaglercraft.com"
   }
 }
