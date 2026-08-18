@@ -3,7 +3,20 @@
   "main": "worker.js",
   "compatibility_date": "2026-08-12",
   "vars": {
-    "SERVER": "SERVERADDRESS:25565",
-    "CLIENT": "https://eaglercraft.com"
-  }
+    "SERVER": "SERVERADDRESS:25565"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "EAGLER_PROXY",
+        "class_name": "EaglerProxy"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["EaglerProxy"]
+    }
+  ]
 }
