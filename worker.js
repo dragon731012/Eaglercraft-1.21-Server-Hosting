@@ -45,7 +45,7 @@ function buildFrame(opcode, payload) {
 
 class FrameParser {
   constructor(onMessage, onClose) {
-    this.queue = [];
+    this.queue = []; 
     this.queuedLen = 0;
     this.onMessage = onMessage;
     this.onClose = onClose;
@@ -313,6 +313,7 @@ export class EaglerProxy extends DurableObject {
 
 export default {
   async fetch(request, env) {
+
     const id = env.EAGLER_PROXY.newUniqueId();
     const stub = env.EAGLER_PROXY.get(id);
     return stub.fetch(request);
