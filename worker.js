@@ -1,229 +1,320 @@
 import { connect } from "cloudflare:sockets";
+import { DurableObject } from "cloudflare:workers";
 
-function encode(bytes) {
-  let out = "";
-  for (let i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i]);
-  return btoa(out);
-}
-
-function randombytes(n) {
+function randomBytes(n) {
   const b = new Uint8Array(n);
   crypto.getRandomValues(b);
   return b;
 }
 
-function join(...parts) {
-  let total = 0;
-  for (const p of parts) total += p.length;
-  const out = new Uint8Array(total);
-  let pos = 0;
-  for (const p of parts) {
-    out.set(p, pos);
-    pos += p.length;
+function base64Encode(bytes) {
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
+
+function buildFrame(opcode, payload) {
+  const len = payload.length;
+  let header;
+  if (len < 126) {
+    header = new Uint8Array(6);
+    header[1] = 0x80 | len;
+  } else if (len < 65536) {
+    header = new Uint8Array(8);
+    header[1] = 0x80 | 126;
+    header[2] = (len >> 8) & 0xff;
+    header[3] = len & 0xff;
+  } else {
+    header = new Uint8Array(14);
+    header[1] = 0x80 | 127;
+    new DataView(header.buffer).setUint32(10, len, false);
   }
+  header[0] = 0x80 | opcode;
+
+  const maskKey = randomBytes(4);
+  header.set(maskKey, header.length - 4);
+
+  const out = new Uint8Array(header.length + len);
+  out.set(header, 0);
+  for (let i = 0; i < len; i++) out[header.length + i] = payload[i] ^ maskKey[i % 4];
   return out;
 }
 
-const enc = new TextEncoder();
-const dec = new TextDecoder();
-
-function frame(opcode, data) {
-  const len = data.length;
-  let head;
-  if (len < 126) {
-    head = new Uint8Array(6);
-    head[1] = 0x80 | len;
-  } else if (len < 65536) {
-    head = new Uint8Array(8);
-    head[1] = 0x80 | 126;
-    head[2] = (len >> 8) & 0xff;
-    head[3] = len & 0xff;
-  } else {
-    head = new Uint8Array(14);
-    head[1] = 0x80 | 127;
-    new DataView(head.buffer).setUint32(10, len, false);
-  }
-  head[0] = 0x80 | opcode;
-
-  const key = randombytes(4);
-  head.set(key, head.length - 4);
-  const masked = new Uint8Array(len);
-  for (let i = 0; i < len; i++) masked[i] = data[i] ^ key[i % 4];
-
-  return join(head, masked);
-}
-
-class reader {
-  constructor(onmessage, onclose) {
-    this.buf = new Uint8Array(0);
-    this.onmessage = onmessage;
-    this.onclose = onclose;
-    this.parts = [];
-    this.partsop = null;
+class FrameParser {
+  constructor(onMessage, onClose) {
+    this.queue = [];
+    this.queuedLen = 0;
+    this.onMessage = onMessage;
+    this.onClose = onClose;
+    this.fragments = [];
+    this.fragmentOpcode = null;
   }
 
   push(chunk) {
-    this.buf = join(this.buf, chunk);
-    this.drain();
+    if (chunk.length > 0) {
+      this.queue.push(chunk);
+      this.queuedLen += chunk.length;
+    }
+    this._parse();
   }
 
-  drain() {
+  _peek(n) {
+    if (this.queuedLen < n) return null;
+    if (this.queue[0].length >= n) return this.queue[0].subarray(0, n);
+    const out = new Uint8Array(n);
+    let filled = 0;
+    for (const c of this.queue) {
+      const take = Math.min(c.length, n - filled);
+      out.set(c.subarray(0, take), filled);
+      filled += take;
+      if (filled >= n) break;
+    }
+    return out;
+  }
+
+  _consume(n) {
+    let remaining = n;
+    while (remaining > 0) {
+      const head = this.queue[0];
+      if (head.length <= remaining) {
+        remaining -= head.length;
+        this.queue.shift();
+      } else {
+        this.queue[0] = head.subarray(remaining);
+        remaining = 0;
+      }
+    }
+    this.queuedLen -= n;
+  }
+
+  _parse() {
     for (;;) {
-      if (this.buf.length < 2) return;
-      const b0 = this.buf[0];
-      const b1 = this.buf[1];
+      const head = this._peek(2);
+      if (!head) return;
+      const b0 = head[0];
+      const b1 = head[1];
       const fin = (b0 & 0x80) !== 0;
       const opcode = b0 & 0x0f;
       const masked = (b1 & 0x80) !== 0;
       let len = b1 & 0x7f;
-      let pos = 2;
+      let headerLen = 2;
 
       if (len === 126) {
-        if (this.buf.length < pos + 2) return;
-        len = (this.buf[pos] << 8) | this.buf[pos + 1];
-        pos += 2;
+        const ext = this._peek(4);
+        if (!ext) return;
+        len = (ext[2] << 8) | ext[3];
+        headerLen = 4;
       } else if (len === 127) {
-        if (this.buf.length < pos + 8) return;
-        len = Number(new DataView(this.buf.buffer, this.buf.byteOffset + pos, 8).getBigUint64(0, false));
-        pos += 8;
+        const ext = this._peek(10);
+        if (!ext) return;
+        len = Number(new DataView(ext.buffer, ext.byteOffset + 2, 8).getBigUint64(0, false));
+        headerLen = 10;
       }
 
-      let key = null;
-      if (masked) {
-        if (this.buf.length < pos + 4) return;
-        key = this.buf.slice(pos, pos + 4);
-        pos += 4;
-      }
+      if (masked) headerLen += 4;
 
-      if (this.buf.length < pos + len) return;
+      const total = headerLen + len;
+      const full = this._peek(total);
+      if (!full) return;
 
-      let payload = this.buf.slice(pos, pos + len);
+      let maskKey = null;
+      if (masked) maskKey = full.subarray(headerLen - 4, headerLen);
+
+      let payload = full.subarray(headerLen, headerLen + len);
       if (masked) {
         const unmasked = new Uint8Array(len);
-        for (let i = 0; i < len; i++) unmasked[i] = payload[i] ^ key[i % 4];
+        for (let i = 0; i < len; i++) unmasked[i] = payload[i] ^ maskKey[i % 4];
         payload = unmasked;
+      } else {
+        payload = payload.slice();
       }
 
-      this.buf = this.buf.slice(pos + len);
+      this._consume(total);
 
       if (opcode === 0x8) {
-        this.onclose();
+        this.onClose(payload);
         return;
       } else if (opcode === 0x9 || opcode === 0xa) {
         continue;
       } else if (opcode === 0x0) {
-        this.parts.push(payload);
+        this.fragments.push(payload);
         if (fin) {
-          this.onmessage(this.partsop, join(...this.parts));
-          this.parts = [];
-          this.partsop = null;
+          const totalLen = this.fragments.reduce((n, c) => n + c.length, 0);
+          const merged = new Uint8Array(totalLen);
+          let o = 0;
+          for (const c of this.fragments) { merged.set(c, o); o += c.length; }
+          this.onMessage(this.fragmentOpcode, merged);
+          this.fragments = [];
+          this.fragmentOpcode = null;
         }
       } else if (fin) {
-        this.onmessage(opcode, payload);
+        this.onMessage(opcode, payload);
       } else {
-        this.parts = [payload];
-        this.partsop = opcode;
+        this.fragments = [payload];
+        this.fragmentOpcode = opcode;
       }
     }
   }
 }
 
-export default {
-  async fetch(request, env, ctx) {
-    if ((request.headers.get("Upgrade") || "").toLowerCase() !== "websocket") {
+class WriteQueue {
+  constructor(writer) {
+    this.writer = writer;
+    this.tail = Promise.resolve();
+  }
+  push(bytes) {
+    this.tail = this.tail.then(() => this.writer.write(bytes)).catch((e) => {
+      console.log(`Write to backend failed: ${e.message}`);
+    });
+    return this.tail;
+  }
+}
+
+export class EaglerProxy extends DurableObject {
+  constructor(state, env) {
+    super(state, env);
+    this.writeQueue = null;
+    this.rawWriter = null;
+    this.parser = null;
+  }
+
+  async fetch(request) {
+    const upgrade = request.headers.get("Upgrade");
+    if (!upgrade || upgrade.toLowerCase() !== "websocket") {
+      return new Response("Connect from an eaglercraft client, not the browser.", { status: 426 });
+    }
+
+    const address = this.env.SERVER;
+    if (!address || address === "SERVERADDRESS:25565") {
       return new Response(
-        `<script>window.location.href=${JSON.stringify(env.CLIENT)};</script>`,
-        {
-          status: 200,
-          headers: { "Content-Type": "text/html;charset=UTF-8" },
-        }
+        "SERVER variable missing. Go to Settings > Variables and set it to your Minecraft server's address",
+        { status: 500 }
       );
     }
 
-    const split = env.SERVER.lastIndexOf(":");
-    const host = env.SERVER.slice(0, split);
-    const port = parseInt(env.SERVER.slice(split + 1), 10);
+    const lastColon = address.lastIndexOf(":");
+    const host = address.slice(0, lastColon);
+    const port = parseInt(address.slice(lastColon + 1), 10);
 
-    const socket = connect({ hostname: host, port });
-    const writer = socket.writable.getWriter();
-    const backend = socket.readable.getReader();
+    let socket;
+    try {
+      socket = connect({ hostname: host, port });
+    } catch (err) {
+      return new Response(`Failed to open TCP socket to backend: ${err.message}`, { status: 502 });
+    }
 
-    const key = encode(randombytes(16));
+    const rawWriter = socket.writable.getWriter();
+    const reader = socket.readable.getReader();
+    this.rawWriter = rawWriter;
+    this.writeQueue = new WriteQueue(rawWriter);
+
+    const secWebSocketKey = base64Encode(randomBytes(16));
     const handshake =
       `GET / HTTP/1.1\r\n` +
       `Host: ${host}\r\n` +
       `Upgrade: websocket\r\n` +
       `Connection: Upgrade\r\n` +
-      `Sec-WebSocket-Key: ${key}\r\n` +
+      `Sec-WebSocket-Key: ${secWebSocketKey}\r\n` +
       `Sec-WebSocket-Version: 13\r\n\r\n`;
 
-    await writer.write(enc.encode(handshake));
-
-    let resp = new Uint8Array(0);
-    let headerend = -1;
-    while (headerend === -1) {
-      const { value, done } = await backend.read();
-      if (done) return new Response("backend closed during handshake", { status: 502 });
-      resp = join(resp, value);
-      headerend = dec.decode(resp).indexOf("\r\n\r\n");
+    try {
+      await rawWriter.write(textEncoder.encode(handshake));
+    } catch (err) {
+      return new Response(`Failed to send handshake: ${err.message}`, { status: 502 });
     }
 
-    const header = dec.decode(resp.slice(0, headerend));
-    const leftover = resp.slice(headerend + 4);
+    let respBuf = new Uint8Array(0);
+    let headerEnd = -1;
+    while (headerEnd === -1) {
+      const { value, done } = await reader.read();
+      if (done) return new Response("Backend closed connection during handshake", { status: 502 });
+      const merged = new Uint8Array(respBuf.length + value.length);
+      merged.set(respBuf, 0);
+      merged.set(value, respBuf.length);
+      respBuf = merged;
 
-    if (!header.split("\r\n")[0].includes(" 101")) {
-      return new Response(`backend rejected handshake:\n${header}`, { status: 502 });
+      for (let i = 0; i + 3 < respBuf.length; i++) {
+        if (respBuf[i] === 13 && respBuf[i + 1] === 10 && respBuf[i + 2] === 13 && respBuf[i + 3] === 10) {
+          headerEnd = i + 4;
+          break;
+        }
+      }
+      if (respBuf.length > 32768) return new Response("Backend handshake response too large", { status: 502 });
     }
 
-    const pair = new WebSocketPair();
-    const client = pair[0];
-    const server = pair[1];
-    server.accept();
-    server.binaryType = "arraybuffer";
+    const headerStr = textDecoder.decode(respBuf.slice(0, headerEnd));
+    const leftover = respBuf.slice(headerEnd);
 
-    const parser = new reader(
+    if (!headerStr.split("\r\n")[0].includes(" 101")) {
+      return new Response(`Backend rejected handshake:\n${headerStr}`, { status: 502 });
+    }
+
+    const { 0: client, 1: server } = new WebSocketPair();
+
+    this.ctx.acceptWebSocket(server);
+
+    this.parser = new FrameParser(
       (opcode, payload) => {
-        if (opcode === 0x2) server.send(payload);
-        else server.send(dec.decode(payload));
+        try {
+          if (opcode === 0x2) server.send(payload);
+          else server.send(textDecoder.decode(payload));
+        } catch (e) {}
       },
-      () => server.close(1000, "backend closed")
+      () => {
+        try { server.close(1000, "backend closed"); } catch (e) {}
+      }
     );
 
-    if (leftover.length > 0) parser.push(leftover);
+    if (leftover.length > 0) this.parser.push(leftover);
 
-    ctx.waitUntil((async () => {
+    this.ctx.waitUntil((async () => {
       try {
         for (;;) {
-          const { value, done } = await backend.read();
+          const { value, done } = await reader.read();
           if (done) break;
-          parser.push(value);
+          this.parser.push(value);
         }
+      } catch (e) {
+        console.log(`Backend read loop error: ${e.message}`);
       } finally {
-        server.close(1000, "backend closed");
+        try { server.close(1000, "backend closed"); } catch (e) {}
       }
     })());
 
-    server.addEventListener("message", (event) => {
-      ctx.waitUntil((async () => {
-        let opcode, payload;
-        if (typeof event.data === "string") {
-          opcode = 0x1;
-          payload = enc.encode(event.data);
-        } else {
-          opcode = 0x2;
-          payload = new Uint8Array(event.data);
-        }
-        await writer.write(frame(opcode, payload));
-      })());
-    });
-
-    server.addEventListener("close", async () => {
-      try {
-        await writer.write(frame(0x8, new Uint8Array(0)));
-        await writer.close();
-      } catch (e) {}
-    });
-
     return new Response(null, { status: 101, webSocket: client });
+  }
+
+  async webSocketMessage(ws, message) {
+    let payload, opcode;
+    if (typeof message === "string") {
+      opcode = 0x1;
+      payload = textEncoder.encode(message);
+    } else {
+      opcode = 0x2;
+      payload = new Uint8Array(message);
+    }
+    this.writeQueue.push(buildFrame(opcode, payload));
+  }
+
+  async webSocketClose(ws, code, reason) {
+    try {
+      await this.writeQueue.push(buildFrame(0x8, new Uint8Array(0)));
+      await this.rawWriter.close();
+    } catch (e) {}
+  }
+
+  async webSocketError(ws, error) {
+    try { await this.rawWriter.close(); } catch (e) {}
+  }
+}
+
+export default {
+  async fetch(request, env) {
+    const id = env.EAGLER_PROXY.newUniqueId();
+    const stub = env.EAGLER_PROXY.get(id);
+    return stub.fetch(request);
   },
 };
