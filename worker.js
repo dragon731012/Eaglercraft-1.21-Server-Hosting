@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 
-const MAX_PLAYERS_PER_POOL = 15;
+const MAX_PLAYERS_PER_POOL = 25;
 const MAX_POOL_INDEX = 20;
 const IDLE_TIMEOUT_MS = 10 * 60 * 1000;
 const IDLE_CHECK_INTERVAL_MS = 60 * 1000;
