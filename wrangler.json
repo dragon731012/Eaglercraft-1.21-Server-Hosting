@@ -7,7 +7,7 @@
   },
   "durable_objects": {
     "bindings": [
-      {
+      { 
         "name": "EAGLER_PROXY",
         "class_name": "EaglerProxy"
       }
